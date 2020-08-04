@@ -4,10 +4,16 @@
 # use only for war purposes and sarcasm
 
 import sys
+import argparse
 import numpy as np
 import cv2 as cv
-import scipy.interpolate # interp2d
-import scipy.ndimage # gaussian_filter1d
+
+import scipy.ndimage
+# contains lots of useful stuff that's also in OpenCV
+# https://scipy.github.io/devdocs/ndimage.html
+
+
+### "business logic" ###################################################
 
 def build_transform(p0, p1, stride=None, nsamples=None):
 	"builds an affine transform with x+ along defined line"
@@ -51,10 +57,11 @@ def build_transform(p0, p1, stride=None, nsamples=None):
 def sample_opencv(im, M, nsamples):
 	
 	# use transform to get samples
-	samples = cv.warpAffine(im, M=M, dsize=(nsamples, 1), flags=cv.WARP_INVERSE_MAP | cv.INTER_CUBIC)
+	# available: INTER_{NEAREST,LINEAR,AREA,CUBIC,LANCOS4)
+	samples = cv.warpAffine(im, M=M, dsize=(nsamples, 1), flags=cv.WARP_INVERSE_MAP | cv.INTER_CUBIC )
 
-	# data is a row vector
-	samples = samples[0]
+	# flatten row vector
+	samples.shape = (-1,)
 
 	# INTER_CUBIC seems to break down beyond 1/32 sampling (discretizes).
 	# there might be fixed point algorithms at work
@@ -62,80 +69,136 @@ def sample_opencv(im, M, nsamples):
 	return samples
 
 def sample_scipy(im, M, nsamples):
-	# https://docs.scipy.org/doc/scipy/reference/generated/scipy.interpolate.interp2d.html
+	# coordinates to this function are (i,j) = (y,x)
+	# I could permute first and second rows+columns of M, or transpose input+output
+	Mp = M.copy()
+	Mp[(0,1), :] = Mp[(1,0), :] # permute rows
+	Mp[:, (0,1)] = Mp[:, (1,0)] # permute columns
 
-	coords = np.vstack([np.arange(nsamples), np.zeros(nsamples), np.ones(nsamples)])
+	samples = scipy.ndimage.interpolation.affine_transform(
+		input=im, matrix=Mp, output_shape=(1, nsamples),
+		order=2, # 1: linear (C0, f' is piecewise constant), 2: C1 (f' is piecewise linear), 3: C2... https://en.wikipedia.org/wiki/Smoothness
+		mode='nearest' # border handling
+	)
 
-	coords_mapped = M.astype(np.float32) @ coords # @ = np.dot
-
-	# FIXME: interp2d() is an expensive operation if the image is large
-	#        maybe crop to bounding box of line (bbox of coords_mapped)?
-	sampler = scipy.interpolate.interp2d(x=np.arange(imw), y=np.arange(imh), z=im, kind='cubic')
-
-	sampler = np.vectorize(sampler) # doesn't cake coordinate pairs as is, vectorize() handles that (!= execution speed!)
-	samples = sampler(*coords_mapped) # fairly fast compared to building the sampler (interp2d)
+	# flatten row vector
+	samples.shape = (-1,)
 
 	return samples
 
+### command line parsing utility functions #############################
+
+def parse_linestr(arg):
+	pieces = arg.split(",")
+	pieces = [float(el) for el in pieces]
+	x0,y0,x1,y1 = pieces
+	return ((x0,y0), (x1,y1))
+
+def parse_bool(arg):
+	if isinstance(arg, bool):
+	   return arg
+	if arg.lower() in ('yes', 'true', 't', 'y', '1'):
+		return True
+	elif arg.lower() in ('no', 'false', 'f', 'n', '0'):
+		return False
+	else:
+		raise argparse.ArgumentTypeError(f'Boolean value expected, got {arg!r} instead')
+
+def parse_float(arg):
+	import ast
+
+	if '/' in arg:
+		num, denom = arg.split('/', 1)
+		num = ast.literal_eval(num)
+		denom = ast.literal_eval(denom)
+		result = num / denom
+
+	else:
+		result = ast.literal_eval(arg)
+
+	return result
+
+### main... ############################################################
 
 if __name__ == '__main__':
-	do_display = True # see below
-	do_invert = True
+	# command line argument parsing
+	# change defaults here
 
-	# to remove pixel noise
-	smoothing_sigma = 2 # in pixels
-
-	# define a line segment to sample along
-	p0, p1 = (1320, 2500), (1320, 2100)
-	stride = 1/4 # sample stride in pixels
-
-	# the picture to work with
-	if len(sys.argv) >= 2:
-		imfname = sys.argv[1]
-	else:
-		imfname = "dish-1.jpg"
+	parser = argparse.ArgumentParser()
+	parser.add_argument("--picture", dest="fname", metavar="PATH", type=str, default="dish-1.jpg",
+		help="path to picture file")
+	parser.add_argument("--invert", type=parse_bool, default=True, metavar="BOOL",
+		help="invert picture (cosmetic; distance between gradient extrema is absolute)")
+	parser.add_argument("--line", type=parse_linestr, default=((1320, 2500), (1320, 2100)), metavar="X0,Y0,X1,Y1",
+		help="line to sample on")
+	parser.add_argument("--stride", type=parse_float, default=1/4, metavar="PX",
+		help="stride in pixels to sample along line, fractions supported")
+	parser.add_argument("--method", type=lambda s: s.lower(), default="scipy",
+		help="sampling methods: SciPy (slower, smoother, default), OpenCV (faster, less smooth)")
+	parser.add_argument("--sigma", type=float, default=2.0, metavar="PX",
+		help="sigma for gaussian lowpass on sampled signal, before gradient is calculated")
+	parser.add_argument("--verbose", type=parse_bool, default=True, metavar="BOOL",
+		help="chatty or not")
+	parser.add_argument("--display", type=parse_bool, default=True, metavar="BOOL",
+		help="draw some plots")
+	parser.add_argument("--saveplot", type=str, default="plot.png", metavar="PATH",
+		help="save a picture (use '--saveplot=' to disable)")
+	args = parser.parse_args()
 
 	########## here be dragons ##########
 
-	decimals = max(0, int(np.ceil(-np.log10(stride))))
+	if args.stride > 1:
+		print(f"WARNING: stride should be <= 1, is {args.stride}")
 
-	print("loading picture...", end=" ", flush=True)
-	im = cv.imread(imfname, cv.IMREAD_GRAYSCALE)
+	stride_decimals = max(0, int(np.ceil(-np.log10(args.stride))))
+
+	if args.verbose: print("loading picture...", end=" ", flush=True)
+	im = cv.imread(args.fname, cv.IMREAD_GRAYSCALE)
 	imh, imw = im.shape[:2]
-	if do_invert:
+	if args.invert:
 		im = 255-im # invert
 	im = im.astype(np.float32)# * np.float32(1/255)
-	print("done")
+	if args.verbose: print("done")
 
 	# build transform
-	nsamples, M = build_transform(p0, p1, stride=stride)
+	p0, p1 = args.line
+	nsamples, M = build_transform(p0, p1, stride=args.stride)
 
-	print(f"taking {nsamples} samples along line {p0} -> {p1}...", end=" ", flush=True)
+	if args.verbose: print(f"taking {nsamples} samples along line {p0} -> {p1}...", end=" ", flush=True)
 
 	# pick one
-	samples = sample_opencv(im, M, nsamples) # does "normal" cubic (4 support points, continuous first derivative)
-	#samples = sample_scipy(im, M, nsamples) # does some fancy cubic with continuous higher derivatives
+	if args.method == 'opencv':
+		samples = sample_opencv(im, M, nsamples) # does "normal" cubic (4x4 support points, continuous first derivative)
+	elif args.method == 'scipy':
+		samples = sample_scipy(im, M, nsamples) # does some fancy "cubic" with continuous higher derivatives
+	else:
+		assert False, "method needs to be opencv or scipy"
 
-	print("sampling done")
+	if args.verbose: print("sampling done")
 
 	# smoothing to remove noise
-	if smoothing_sigma > 0:
-		samples = scipy.ndimage.gaussian_filter1d(samples, sigma=smoothing_sigma / stride)
+	if args.sigma > 0:
+		if args.verbose: print(f"lowpass filtering with sigma = {args.sigma} px...", end=" ", flush=True)
+		samples = scipy.ndimage.gaussian_filter1d(samples, sigma=args.sigma / args.stride)
+		if args.verbose: print("done")
 
 	# off-by-half in position because for values [0,1,1,0] this returns [+1,0,-1]
-	gradient = np.diff(samples) / stride
+	gradient = np.diff(samples) / args.stride
 
 	i_falling = np.argmin(gradient) # in samples
 	i_rising = np.argmax(gradient) # in samples
 
-	distance = (i_rising - i_falling) * stride # in pixels
+	distance = np.abs(i_rising - i_falling) * args.stride # in pixels
 
-	print(f"distance: {distance:.{decimals}f} pixels")
+	if args.verbose:
+		print(f"distance: {distance:.{stride_decimals}f} pixels")
+	else:
+		print(distance)
 
 	# this was the result. algorithm is done.
 	# now follows displaying code
 
-	if do_display:
+	if args.display or args.saveplot:
 		gradient *= 255 / np.abs(gradient).max()
 
 		# plot signal
@@ -171,27 +234,36 @@ if __name__ == '__main__':
 		cv.line(canvas, (px_rising, 0), (px_rising, 400*2), color=(255,0,0))
 
 		# some text to describe the picture
-		cv.putText(canvas, f"sampling {p0} -> {p1}",
+		cv.putText(canvas, f"{nsamples*args.stride:.0f} px, {p0} -> {p1}",
 			(10, 350), cv.FONT_HERSHEY_SIMPLEX, 0.75, (255,255,255), thickness=1, lineType=cv.LINE_AA)
 
-		cv.putText(canvas, f"stride {stride} px, {nsamples} samples, sigma {smoothing_sigma}",
+		cv.putText(canvas, f"stride {args.stride} px, {nsamples} samples, sigma {args.sigma}",
 			(10, 350+35), cv.FONT_HERSHEY_SIMPLEX, 0.75, (255,255,255), thickness=1, lineType=cv.LINE_AA)
 
-		cv.putText(canvas, f"distance: {distance:.{decimals}f} px",
+		cv.putText(canvas, f"distance: {distance:.{stride_decimals}f} px",
 			(10, 350+70), cv.FONT_HERSHEY_SIMPLEX, 0.75, (255,255,255), thickness=1, lineType=cv.LINE_AA)
 
 		# save for posterity
-		cv.imwrite("plot.png", canvas)
+		if args.saveplot:
+			cv.imwrite(args.saveplot, canvas)
 
-		cv.imshow("plot", canvas)
+		if args.display:
+			cv.imshow("plot", canvas)
 
-		print("press Ctrl+C in the terminal, or press any key while the imshow() window is focused")
+			if args.verbose:
+				print("press Ctrl+C in the terminal, or press any key while the imshow() window is focused")
 
-		while True:
-			keycode = cv.waitKey(100)
-			if keycode == -1:
-				continue
-			else:
-				print(f"keycode: {keycode}")
+			while True:
+				keycode = cv.waitKey(100)
+
+				if keycode == -1:
+					continue
+
+				# some key...
+
+				if args.verbose:
+					print(f"keycode: {keycode}")
+
+				cv.destroyAllWindows()
 				break
 
