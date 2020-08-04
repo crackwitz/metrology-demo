@@ -1,5 +1,7 @@
 # metrology demo
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.3972262.svg)](https://doi.org/10.5281/zenodo.3972262)
+
 this is a "quick and dirty" concept sketch.
 
 concepts/steps:
