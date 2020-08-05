@@ -1,6 +1,6 @@
 # metrology demo
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.3972444.svg)](https://doi.org/10.5281/zenodo.3972444)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.3972261.svg)](https://doi.org/10.5281/zenodo.3972261)
 
 this is a "quick and dirty" concept sketch.
 
